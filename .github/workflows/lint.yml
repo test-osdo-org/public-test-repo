@@ -1,7 +1,11 @@
 name: "Project: Lint"
 on:
-  pull_request:
-    types: [opened, synchronize, reopened, ready_for_review]
+  workflow_dispatch:
+    inputs:
+      expected_sha:
+        description: 'Expected PR HEAD SHA'
+        required: false
+        type: string
 permissions:
   contents: read
 jobs:
