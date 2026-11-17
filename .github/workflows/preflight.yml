@@ -7,6 +7,7 @@ permissions:
 jobs:
   preflight:
     runs-on: ubuntu-latest
+    environment: trusted-pr-deployment
     steps:
       - name: Preflight check
         run: |
