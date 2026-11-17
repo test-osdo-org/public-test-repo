@@ -7,14 +7,14 @@ permissions:
 jobs:
   lint:
     runs-on: ubuntu-latest
-    environment: trusted-pr-deployment
     steps:
       - name: Lint check
         run: |
           echo "=== Trusted PR Front-Door Gate: Lint ==="
           echo "SHA: $GITHUB_SHA"
           echo ""
-          echo "This workflow PROVES the front-door hold mechanism."
-          echo "It was held in action_required state until released by /trusted-run."
+          echo "WARNING: This job has NO environment: declaration."
+          echo "It is NOT protected by the DPR gate."
+          echo "It will execute after any workflow approval — including a human bypass."
           echo ""
-          echo "Lint complete — PASS"
+          echo "Lint complete — PASS (but UNPROTECTED)"
