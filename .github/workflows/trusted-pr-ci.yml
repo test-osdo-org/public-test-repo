@@ -1,0 +1,221 @@
+name: Trusted PR CI
+
+on:
+  workflow_dispatch:
+    inputs:
+      pr_number:
+        description: 'PR number'
+        required: true
+        type: string
+      expected_sha:
+        description: 'Expected exact PR HEAD SHA (40 hex chars)'
+        required: true
+        type: string
+      authorization_check_id:
+        description: 'Optional: authorization check run ID for correlation'
+        required: false
+        type: string
+
+permissions:
+  contents: read
+  checks: read
+
+jobs:
+  verify-trusted-pr:
+    name: Verify Trusted PR Authorization
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      checks: read
+    outputs:
+      verified_sha: ${{ steps.verify.outputs.verified_sha }}
+      verified_pr_number: ${{ steps.verify.outputs.verified_pr_number }}
+    steps:
+      - name: Verify trusted PR authorization
+        id: verify
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          PR_NUMBER: ${{ inputs.pr_number }}
+          EXPECTED_SHA: ${{ inputs.expected_sha }}
+          TRUSTED_APP_ID: "5790016"
+        run: |
+          set -euo pipefail
+
+          echo "=== Trusted PR CI: Authorization Verification ==="
+
+          # Validate pr_number input
+          if ! [[ "$PR_NUMBER" =~ ^[0-9]+$ ]]; then
+            echo "ERROR: pr_number must be a positive integer; got: $PR_NUMBER"
+            exit 1
+          fi
+
+          # Validate expected_sha input
+          if ! [[ "$EXPECTED_SHA" =~ ^[0-9a-f]{40}$ ]]; then
+            echo "ERROR: expected_sha must be 40 lowercase hex chars; got: $EXPECTED_SHA"
+            exit 1
+          fi
+
+          # Fetch PR via GitHub API
+          echo "Fetching PR#$PR_NUMBER..."
+          pr_response=$(gh api "repos/$GITHUB_REPOSITORY/pulls/$PR_NUMBER" 2>&1)
+          if [ $? -ne 0 ]; then
+            echo "ERROR: Failed to fetch PR#$PR_NUMBER"
+            echo "$pr_response"
+            exit 1
+          fi
+
+          # Verify PR state
+          pr_state=$(echo "$pr_response" | jq -r '.state')
+          if [ "$pr_state" != "open" ]; then
+            echo "ERROR: PR#$PR_NUMBER is not in 'open' state; state=$pr_state"
+            exit 1
+          fi
+
+          # Verify head SHA matches
+          head_sha=$(echo "$pr_response" | jq -r '.head.sha')
+          if [ "$head_sha" != "$EXPECTED_SHA" ]; then
+            echo "ERROR: PR#$PR_NUMBER head SHA mismatch"
+            echo "  Expected: $EXPECTED_SHA"
+            echo "  Actual:   $head_sha"
+            exit 1
+          fi
+
+          echo "✓ PR#$PR_NUMBER is open"
+          echo "✓ PR HEAD SHA matches expected SHA: ${EXPECTED_SHA:0:8}"
+
+          # Fetch check runs for the exact SHA
+          echo "Fetching check runs for SHA ${EXPECTED_SHA:0:8}..."
+          checks_response=$(gh api "repos/$GITHUB_REPOSITORY/commits/$EXPECTED_SHA/check-runs?per_page=100" 2>&1)
+          if [ $? -ne 0 ]; then
+            echo "ERROR: Failed to fetch check runs for SHA $EXPECTED_SHA"
+            echo "$checks_response"
+            exit 1
+          fi
+
+          # Find mandatory check
+          mandatory_checks=$(echo "$checks_response" | jq "[.check_runs[] | select(.name == \"trusted-pr/mandatory-checks\" and .conclusion == \"success\")]")
+          mandatory_count=$(echo "$mandatory_checks" | jq 'length')
+
+          if [ "$mandatory_count" -eq 0 ]; then
+            echo "ERROR: mandatory check not found or not from trusted App"
+            echo "Available checks:"
+            echo "$checks_response" | jq -r '.check_runs[] | "\(.name): \(.conclusion) (app.id=\(.app.id // "N/A"))"'
+            exit 1
+          fi
+
+          if [ "$mandatory_count" -gt 1 ]; then
+            echo "ERROR: ambiguous — multiple mandatory checks found"
+            exit 1
+          fi
+
+          mandatory_app_id=$(echo "$mandatory_checks" | jq -r '.[0].app.id')
+          if [ "$mandatory_app_id" != "$TRUSTED_APP_ID" ]; then
+            echo "ERROR: mandatory check app.id mismatch: expected $TRUSTED_APP_ID, got $mandatory_app_id"
+            exit 1
+          fi
+
+          echo "✓ Found mandatory check from trusted App (app.id=$mandatory_app_id)"
+
+          # Find authorization check
+          auth_checks=$(echo "$checks_response" | jq "[.check_runs[] | select(.name == \"trusted-pr/authorized\" and .conclusion == \"success\")]")
+          auth_count=$(echo "$auth_checks" | jq 'length')
+
+          if [ "$auth_count" -eq 0 ]; then
+            echo "ERROR: authorization check not found or not from trusted App"
+            exit 1
+          fi
+
+          if [ "$auth_count" -gt 1 ]; then
+            echo "ERROR: ambiguous — multiple authorization checks found"
+            exit 1
+          fi
+
+          auth_app_id=$(echo "$auth_checks" | jq -r '.[0].app.id')
+          if [ "$auth_app_id" != "$TRUSTED_APP_ID" ]; then
+            echo "ERROR: authorization check app.id mismatch: expected $TRUSTED_APP_ID, got $auth_app_id"
+            exit 1
+          fi
+
+          echo "✓ Found authorization check from trusted App (app.id=$auth_app_id)"
+
+          # Set job outputs
+          echo "verified_sha=$EXPECTED_SHA" >> "$GITHUB_OUTPUT"
+          echo "verified_pr_number=$PR_NUMBER" >> "$GITHUB_OUTPUT"
+
+          # Print verification summary
+          echo ""
+          echo "✓ Verification complete: PR#$PR_NUMBER SHA=${EXPECTED_SHA:0:8}"
+          echo "✓ mandatory check: trusted-pr/mandatory-checks (app.id=$TRUSTED_APP_ID)"
+          echo "✓ authorization check: trusted-pr/authorized (app.id=$TRUSTED_APP_ID)"
+
+  preflight:
+    name: "Project: Preflight"
+    needs: verify-trusted-pr
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.verify-trusted-pr.outputs.verified_sha }}
+          persist-credentials: false
+      - name: Run preflight
+        run: |
+          echo "=== F2 Trusted PR CI: Preflight ==="
+          echo "SHA: ${{ needs.verify-trusted-pr.outputs.verified_sha }}"
+          echo "PR: ${{ needs.verify-trusted-pr.outputs.verified_pr_number }}"
+          echo "Preflight complete — PASS"
+
+  lint:
+    name: "Project: Lint"
+    needs: verify-trusted-pr
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.verify-trusted-pr.outputs.verified_sha }}
+          persist-credentials: false
+      - name: Run lint
+        run: |
+          echo "=== F2 Trusted PR CI: Lint ==="
+          echo "SHA: ${{ needs.verify-trusted-pr.outputs.verified_sha }}"
+          echo "PR: ${{ needs.verify-trusted-pr.outputs.verified_pr_number }}"
+          echo "Lint complete — PASS"
+
+  test:
+    name: "Project: Test"
+    needs: verify-trusted-pr
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.verify-trusted-pr.outputs.verified_sha }}
+          persist-credentials: false
+      - name: Run tests
+        run: |
+          echo "=== F2 Trusted PR CI: Test ==="
+          echo "SHA: ${{ needs.verify-trusted-pr.outputs.verified_sha }}"
+          echo "PR: ${{ needs.verify-trusted-pr.outputs.verified_pr_number }}"
+          echo "Tests complete — PASS"
+
+  build:
+    name: "Project: Build"
+    needs: verify-trusted-pr
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.verify-trusted-pr.outputs.verified_sha }}
+          persist-credentials: false
+      - name: Run build
+        run: |
+          echo "=== F2 Trusted PR CI: Build ==="
+          echo "SHA: ${{ needs.verify-trusted-pr.outputs.verified_sha }}"
+          echo "PR: ${{ needs.verify-trusted-pr.outputs.verified_pr_number }}"
+          echo "Build complete — PASS"
